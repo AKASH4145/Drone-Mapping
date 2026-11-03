@@ -3,6 +3,7 @@
 Usage (from the project folder):
     python src/predict.py --input data/raw/samples/test/Images
     python src/predict.py --input data/raw/samples/val/Images/000000.png
+    python src/predict.py --input path/to/odm_orthophoto.tif --scale 1.0 --overlap 0.5
 """
 import argparse
 import time
@@ -22,8 +23,9 @@ MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 
-def starts(total, tile):
-    s = list(range(0, total - tile + 1, tile))
+def starts(total, tile, stride=None):
+    stride = stride or tile
+    s = list(range(0, total - tile + 1, stride))
     if s[-1] != total - tile:
         s.append(total - tile)
     return s
@@ -36,15 +38,20 @@ def load_model(weights, device):
 
 
 @torch.no_grad()
-def predict_full(model, img_rgb, device, scale=0.5, tile=512):
-    """Downscale, predict tile by tile, average overlaps, upscale back to full size."""
+def predict_full(model, img_rgb, device, scale=0.5, tile=512, overlap=0.0):
+    """Downscale, predict tile by tile, average overlaps, upscale back to full size.
+
+    overlap=0.5 moves tiles by half a tile, so every pixel is predicted about 4 times
+    and averaged. This removes blocky seams at tile borders but takes ~4x longer.
+    """
     small = cv2.resize(img_rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
     H, W = small.shape[:2]
     norm = (small.astype(np.float32) / 255.0 - MEAN) / STD
     probs = torch.zeros(len(CLASSES), H, W)
     count = torch.zeros(1, H, W)
-    for y in starts(H, tile):
-        for x in starts(W, tile):
+    stride = max(1, int(tile * (1 - overlap)))
+    for y in starts(H, tile, stride):
+        for x in starts(W, tile, stride):
             t = torch.from_numpy(np.ascontiguousarray(norm[y:y + tile, x:x + tile].transpose(2, 0, 1)))
             out = model(t.unsqueeze(0).to(device))[0].float().softmax(0).cpu()
             probs[:, y:y + tile, x:x + tile] += out
@@ -77,13 +84,16 @@ def main():
     parser.add_argument('--input', required=True, help='Image file or folder of images')
     parser.add_argument('--weights', default=str(ROOT / 'models' / 'unet_r34_best.pth'))
     parser.add_argument('--out', default=str(ROOT / 'outputs' / 'predictions'))
-    parser.add_argument('--scale', type=float, default=0.5, help='Must match training (0.5)')
+    parser.add_argument('--scale', type=float, default=0.5,
+                        help='Downscale before predicting. 0.5 matches training on UAVid 4K frames')
+    parser.add_argument('--overlap', type=float, default=0.0,
+                        help='Tile overlap from 0 to 0.75. 0.5 removes tile seams, ~4x slower')
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     inp = Path(args.input)
     if inp.is_dir():
-        paths = sorted(p for p in inp.rglob('*') if p.suffix.lower() in ('.png', '.jpg', '.jpeg')
+        paths = sorted(p for p in inp.rglob('*') if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.tif', '.tiff')
                        and p.parent.name != 'Labels')
     else:
         paths = [inp]
@@ -105,7 +115,7 @@ def main():
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         t0 = time.time()
-        pred = predict_full(model, rgb, device, scale=args.scale)
+        pred = predict_full(model, rgb, device, scale=args.scale, overlap=args.overlap)
         dt = time.time() - t0
 
         colour = PALETTE[pred]
