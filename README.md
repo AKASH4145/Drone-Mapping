@@ -1,6 +1,6 @@
 # Drone Mapping with Deep Learning
 
-A drone mapping pipeline: a segmentation model labels every pixel of an aerial image as building, road, tree, low vegetation, car, human or clutter, and those labels are turned into a georeferenced land-cover map of a whole area.
+A drone mapping pipeline: a segmentation model labels every pixel of an aerial image as building, road, tree, low vegetation, car, human or clutter, those labels are turned into a georeferenced land-cover map of a whole area, and a Siamese network compares two images of the same place to find what changed between dates.
 
 ![Test frame prediction](assets/test_000000_overlay.jpg)
 
@@ -12,11 +12,11 @@ Drones can survey an area much faster than ground teams, but raw footage is hard
 
 1. Train a segmentation model on drone images (done)
 2. Turn predictions into a single labelled map of an area (done, first version)
-3. Compare maps of the same area over time to detect changes (planned)
+3. Compare images of the same area over time to detect what changed (done, first version)
 
 ## Tech stack
 
-Python, PyTorch, segmentation-models-pytorch, OpenCV, NumPy, rasterio, OpenDroneMap. Training on Google Colab (T4 GPU), everything else runs on CPU.
+Python, PyTorch, segmentation-models-pytorch, OpenCV, NumPy, rasterio, OpenDroneMap. Training on Google Colab and Kaggle (T4 GPU), everything else runs on CPU.
 
 ## Dataset
 
@@ -27,6 +27,8 @@ Python, PyTorch, segmentation-models-pytorch, OpenCV, NumPy, rasterio, OpenDrone
 - Each image is downscaled to 1920x1080 and cut into 512x512 tiles, giving 2,400 training tiles and 840 validation tiles.
 
 For mapping I used the Sheffield Park 3 sample set from [ODMdata](https://github.com/OpenDroneMap/ODMdata): 32 top-down photos of a park with GPS tags.
+
+For change detection I used [SECOND](https://captain-whu.github.io/SCD): 512x512 aerial image pairs of the same place at two dates, with 6 land-cover classes (water, ground, low vegetation, tree, building, playground). Classes are only labelled where something changed; unchanged pixels are left blank. The download includes 2,968 training pairs and the official test set of 1,694 pairs. I held out 10% of the training pairs for validation.
 
 ## Model and training
 
@@ -91,6 +93,45 @@ There is no ground truth for this area, so these are the model's estimates, not 
 
 These come from training on oblique city footage and testing on top-down park photos. Fine-tuning on a top-down dataset would fix most of them.
 
+### Change detection
+
+Because SECOND only labels classes in changed areas, the two images have to be looked at together, so I built a Siamese U-Net:
+
+- One shared ResNet34 encoder reads both images. It starts from the UAVid model above, and 276 of its 278 weight tensors are reused (only the final layer changes, from 8 to 6 classes).
+- The U-Net decoder labels the land cover of each image.
+- A small change head takes the absolute difference between the two images' features at every scale, merges them, and predicts changed or unchanged.
+- Final output: where the change head says changed, the class before and the class after.
+- Loss: cross-entropy for land cover (unchanged pixels ignored) plus binary cross-entropy and Dice for change. AdamW, learning rate 3e-4, cosine schedule, batch size 8, mixed precision, 10 epochs (about 1.5 hours on a Kaggle T4).
+
+Results on the official test set (1,694 pairs, used once at the end; the best epoch was picked on validation):
+
+| Metric | Val | Test |
+|---|---|---|
+| SeK | 0.215 | 0.199 |
+| Fscd | 0.608 | 0.600 |
+| mIoU (changed / unchanged) | 0.726 | 0.714 |
+| Overall accuracy | 0.869 | 0.863 |
+| Change precision | 0.745 | 0.719 |
+| Change recall | 0.718 | 0.718 |
+| Change F1 | 0.731 | 0.718 |
+
+SeK and Fscd are the standard SECOND metrics. Both only reward a changed pixel when the class before and the class after are both right, which makes them much stricter than the plain change F1. I used the same formulas as the [Bi-SRNet](https://github.com/wdc233/Bi-SRNet) code.
+
+For reference, the Bi-SRNet paper reports SeK 0.188 for HRSCD-str.4, 0.219 for SSCD-l and 0.232 for Bi-SRNet. Those were measured on a 593-pair split of the released data, not the official test set used here, so this is a rough comparison, not a ranking.
+
+![SECOND test examples](assets/test_00004_result.jpg) (assests/test_00087_result.jpg) (assests/test_00014_result.jpg)
+
+Columns: before, after, true labels before and after, predicted before and after. White = unchanged, grey = ground, dark green = low vegetation, bright green = tree, dark red = building, red = playground, blue = water.
+
+What the results show:
+
+- The changed / unchanged mask is the most reliable part. Precision and recall are both about 0.72.
+- Most errors are in the class, not the location. 18% of true tree pixels are predicted as low vegetation, and ground and low vegetation are confused both ways (about 9% each). These look alike from above, and the two dates are often in different seasons.
+- Building is the strongest class (recall 0.75). Water and tree are the weakest (recall 0.34). Water makes up only 0.25% of test pixels.
+- Validation and test scores are close, so picking the best epoch on validation did not overfit.
+- Scores were still rising at epoch 10, so longer training should help.
+- I tried a post-processing rule: a pixel predicted as changed but given the same class on both dates is set to unchanged, since SECOND has no same-class changes. On the first 300 test pairs it raised change precision from 0.761 to 0.794 but lowered recall from 0.731 to 0.681, and SeK went from 0.233 to 0.230. Many of those pixels are real changes where only the class is wrong, so the rule is off by default (`--drop-same-class` in `change_detect.py`). These 300 pairs happen to be easier than the full test set, so the official scores are the ones in the table above.
+
 More predictions on UAVid:
 
 ![Test frame 400](assets/test_000400_overlay.jpg)
@@ -104,10 +145,14 @@ drone-mapping/
   notebooks/
     01_data_setup.ipynb           download, inspect and tile UAVid (Colab)
     02_train_segmentation.ipynb   training and evaluation (Colab)
+    03_change_detection.ipynb     change detection on Hi-UCD (prepared, not run yet: waiting for dataset access)
+    04_second_change_detection.ipynb   Siamese U-Net change detection on SECOND (Colab or Kaggle)
   src/
     predict.py      run the model on full-size frames
     ortho_map.py    land-cover map from an ODM orthophoto, with coordinates and areas
     stitch.py       lightweight stitching of nadir photos without ODM
+    siamese.py      Siamese U-Net model used for change detection
+    change_detect.py   run the change detection model on image pairs (CPU), with scoring if labels exist
   models/       trained weights (not in the repo)
   data/         datasets and ODM projects (not in the repo)
   outputs/      predictions and maps (not in the repo)
@@ -150,6 +195,19 @@ Saves a colour mask and an overlay for each image to `outputs/predictions/`. If 
 
 Outputs in `outputs/ortho_map/`: a label GeoTIFF with the same coordinates as the orthophoto (opens in QGIS with class colours), a colour mask, an overlay and a JSON file with the area of each class.
 
+### Change detection
+
+Training: open `notebooks/04_second_change_detection.ipynb` in Colab or Kaggle with a GPU and run all cells. It downloads SECOND, unpacks it, trains and saves the results. On Kaggle, attach `unet_r34_best.pth` as a dataset, turn on Internet, and use Save & Run All so it trains in the background.
+
+Prediction (CPU is fine), with `second_siamese_best.pth` in `models/`:
+
+```
+python src/change_detect.py --before path/to/before.png --after path/to/after.png
+python src/change_detect.py --pairs data/second/SECOND_total_test --limit 50
+```
+
+The two images must show the same area and be aligned. Larger images are processed in overlapping 512x512 tiles. `--pairs` takes any folder with `im1` / `im2` folders, and if `label1` / `label2` exist it also prints the SECOND scores. Results go to `outputs/change/`: a picture per pair and a JSON file with the share of changed pixels and the most common changes. Add `--pixel-size` (metres) to get areas in m².
+
 ### Stitching without ODM
 
 ```
@@ -160,7 +218,9 @@ A simpler alternative I wrote to understand how stitching works. It matches SIFT
 
 ## Future plans
 
-- Change detection between two maps of the same area captured on different dates
+- Train the change detection model for longer (30 epochs) and add a loss that keeps unchanged areas consistent between dates
+- Run change detection on Hi-UCD (10 cm aerial images) once access is approved, and compare it with the post-classification approach in notebook 03
+- Apply change detection to two drone surveys of the same area
 - Fine-tune the model on top-down drone images
 - Pad image borders before predicting, so edge pixels are not mislabelled as Building
 
@@ -169,6 +229,10 @@ A simpler alternative I wrote to understand how stitching works. It matches SIFT
 UAVid dataset: Lyu et al., "UAVid: A semantic segmentation dataset for UAV imagery", ISPRS Journal of Photogrammetry and Remote Sensing, 2020.
 
 Sheffield Park 3 images from the OpenDroneMap sample datasets.
+
+SECOND dataset: Yang et al., "Semantic Change Detection with Asymmetric Siamese Networks", 2020 (arXiv:2010.05687).
+
+Change detection metrics follow Ding et al., "Bi-Temporal Semantic Reasoning for the Semantic Change Detection in HR Remote Sensing Images", IEEE Transactions on Geoscience and Remote Sensing, 2022.
 
 ## Author
 
