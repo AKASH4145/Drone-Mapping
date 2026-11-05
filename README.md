@@ -138,8 +138,8 @@ More predictions on UAVid:
 
 More Prediction on Change detection :
 
-![Test frame 00087](assets\test_00087_result.jpg) 
-![Test frame 00014](assets\test_00014_result.jpg)
+![Test frame 00087](assets/test_00087_result.jpg) 
+![Test frame 00014](assets/test_00014_result.jpg)
 
 
 ## Project structure
