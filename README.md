@@ -120,7 +120,7 @@ SeK and Fscd are the standard SECOND metrics. Both only reward a changed pixel w
 For reference, the Bi-SRNet paper reports SeK 0.188 for HRSCD-str.4, 0.219 for SSCD-l and 0.232 for Bi-SRNet. Those were measured on a 593-pair split of the released data, not the official test set used here, so this is a rough comparison, not a ranking.
 
 ![SECOND test examples](assets/test_00014_result.jpg)
-Columns: before, after, true labels before and after, predicted before and after. White = unchanged, grey = ground, dark green = low vegetation, bright green = tree, dark red = building, red = playground, blue = water.
+Columns: before, after, predicted before and after, true labels before and after. White = unchanged, grey = ground, dark green = low vegetation, bright green = tree, dark red = building, red = playground, blue = water.
 
 What the results show:
 
